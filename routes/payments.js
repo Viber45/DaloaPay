@@ -4,6 +4,7 @@ const { ENV, checkConfig, getSupabaseAdminClient } = require('../config/env');
 const { createPaymentLimiter } = require('../config/rate-limiters');
 const { requireAuthenticatedUser } = require('../middlewares/auth');
 const { createPaymentSession } = require('../services/moneyfusion');
+const { createCheckoutSession } = require('../services/saspay');
 const { resolveMonetizationPrice } = require('../services/monetization');
 const {
   QuoteError,
@@ -13,8 +14,7 @@ const {
   markQuoteUsed,
 } = require('../services/quote');
 
-// 0) Devis de commande : calculé une fois ici, affiché tel quel par le client,
-//    puis facturé tel quel (/create-payment avec quoteId, ou create_cod_order).
+// 0) Devis de commande : calculé une fois ici, affiché tel quel par le client
 router.post('/quote', requireAuthenticatedUser, async (req, res) => {
   try {
     checkConfig();
@@ -43,7 +43,6 @@ router.post('/quote', requireAuthenticatedUser, async (req, res) => {
         deliveryTotal: saved.delivery_total,
         buyerFeeTotal: saved.buyer_fee_total,
         totalAmount: saved.total_amount,
-        // Distance affichée : la plus longue course du panier.
         distanceKm: Math.max(0, ...saved.sellers.map((x) => Number(x.distance_km) || 0)),
       },
     });
@@ -56,22 +55,18 @@ router.post('/quote', requireAuthenticatedUser, async (req, res) => {
   }
 });
 
-// 1) Créer un paiement (Order Escrow ou Monétisation)
+// 1) Créer un paiement (Order Escrow ou Monétisation) — MoneyFusion ou SasPay
 router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, async (req, res) => {
   console.log('POST /create-payment received', req.body);
   try {
     checkConfig();
     const { type, amount, plan, customerName, customerPhone, metadata, orderInput, orderInputs } = req.body;
 
-    // L'acheteur est celui de la session, jamais celui du corps de la requête :
-    // sinon on pouvait créer une commande ou activer un Pass Pro au nom d'autrui.
     const userId = req.user.id;
     if (req.body.userId && req.body.userId !== userId) {
       return res.status(403).json({ success: false, message: 'Utilisateur non autorisé pour ce paiement.' });
     }
 
-    // `listing_pack_10` (ancien pack de publication) n'est plus vendu : la
-    // publication n'est plus limitée, les crédits servent au boost.
     const allowedTypes = ['seller_badge', 'order', 'credits_pack_5', 'credits_pack_12', 'credits_pack_30'];
     if (!type || !allowedTypes.includes(type)) {
       return res.status(400).json({ success: false, message: 'Type de paiement invalide.' });
@@ -98,15 +93,14 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
       });
     }
 
+    // Sélection du prestataire : priorité à la config DB (à chaud), sinon env var
+    const activeProvider = payConfig.provider || ENV.PAYMENT_PROVIDER || 'moneyfusion';
+
     let transactionId = '';
     let finalAmount = 0;
     let resolvedPlan = null;
 
     if (type === 'order') {
-      // Avec un devis (applications à jour) : on facture exactement ce qui a été
-      // affiché, après avoir vérifié que les articles se vendent au même prix.
-      // Sans devis (anciennes applications) : calcul ici, et refus si le total
-      // dépasse nettement celui que l'acheteur a vu.
       let metaItems;
       let quoteId = null;
       try {
@@ -129,7 +123,7 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
               success: false,
               reason: 'amount_mismatch',
               serverAmount: finalAmount,
-              message: `Le prix de la livraison a été recalculé : le total est de ${finalAmount} FCFA et non ${displayedAmount} FCFA. Revenez à l'étape précédente pour actualiser, ou mettez l'application à jour.`,
+              message: `Le prix de la livraison a été recalculé : le total est de ${finalAmount} FCFA et non ${displayedAmount} FCFA. Revenez à l'étape précédente pour actualiser.`,
             });
           }
         }
@@ -170,8 +164,6 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
       transactionId = escrow.id;
 
     } else {
-      // Prix fixé par le serveur : le `amount` envoyé par l'appli est ignoré
-      // (il ne sert qu'à reconnaître la formule Pro des anciennes APK).
       const price = resolveMonetizationPrice(type, plan, amount);
       if (!price) return res.status(400).json({ success: false, message: 'Type de paiement invalide.' });
       finalAmount = price.amount;
@@ -195,10 +187,13 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
 
     let resolvedName = (customerName || '').trim();
     let cleanPhone = (customerPhone || '').trim().replace(/\s+/g, '');
-    if ((!cleanPhone || !resolvedName) && userId) {
-      const { data: u } = await supabase.from('users').select('phone, full_name').eq('id', userId).maybeSingle();
+    let resolvedEmail = '';
+
+    if (userId) {
+      const { data: u } = await supabase.from('users').select('phone, full_name, email').eq('id', userId).maybeSingle();
       if (!cleanPhone && u?.phone) cleanPhone = u.phone.trim().replace(/\s+/g, '');
       if (!resolvedName && u?.full_name) resolvedName = u.full_name.trim();
+      if (u?.email) resolvedEmail = u.email.trim();
     }
 
     if (cleanPhone.startsWith('+225')) {
@@ -221,11 +216,40 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
       credits_pack_30: 'Pack Or (30 crédits de boost)',
     };
 
+    // BRANCH 1 : Prestataire SasPay
+    if (activeProvider === 'saspay') {
+      if (!resolvedEmail) resolvedEmail = `client_${userId.slice(0, 8)}@daloamarket.com`;
+      const saspayRes = await createCheckoutSession({
+        amount: Math.round(finalAmount),
+        description: labelByType[type] || 'Commande DaloaMarket',
+        customerEmail: resolvedEmail,
+        customerName: resolvedName || 'Client DaloaMarket',
+        customerPhone: cleanPhone ? `+225${cleanPhone}` : '',
+        returnUrl,
+        metadata: { userId, transactionId, type, ...(metadata || {}), ...(orderInput || {}) },
+      });
+
+      if (!saspayRes.ok || !saspayRes.checkout_url) {
+        console.error('[SasPay Init Error]:', saspayRes.data);
+        return res.status(502).json({ success: false, message: saspayRes.data?.message || 'Erreur passerelle SasPay' });
+      }
+
+      const token = saspayRes.id;
+      const paymentUrl = saspayRes.checkout_url;
+
+      if (type === 'order') {
+        await supabase.from('escrow_transactions').update({ payment_reference: token }).eq('id', transactionId);
+        return res.json({ success: true, token, payment_url: paymentUrl, paymentUrl, transactionId });
+      } else {
+        await supabase.from('monetization_transactions').update({ provider_token: token }).eq('id', transactionId);
+        return res.json({ success: true, transactionId, token, paymentUrl, payment_url: paymentUrl });
+      }
+    }
+
+    // BRANCH 2 : Prestataire MoneyFusion (par défaut)
     const fusionPayload = {
       totalPrice: Math.round(finalAmount),
       article: [{ [labelByType[type] || type]: Math.round(finalAmount) }],
-      // Les identifiants passent en dernier : le webhook les relit, l'appli ne
-      // doit pas pouvoir les écraser via `metadata` ou `orderInput`.
       personal_Info: [{ ...(metadata || {}), ...(orderInput || {}), userId, transactionId, type }],
       numeroSend: cleanPhone,
       nomclient: resolvedName || 'Client DaloaMarket',
@@ -245,10 +269,10 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
 
     if (type === 'order') {
       await supabase.from('escrow_transactions').update({ payment_reference: fusionData.token }).eq('id', transactionId);
-      return res.json({ success: true, token: fusionData.token, payment_url: validPaymentUrl, transactionId });
+      return res.json({ success: true, token: fusionData.token, payment_url: validPaymentUrl, paymentUrl: validPaymentUrl, transactionId });
     } else {
       await supabase.from('monetization_transactions').update({ provider_token: fusionData.token }).eq('id', transactionId);
-      return res.json({ success: true, transactionId, token: fusionData.token, paymentUrl: validPaymentUrl });
+      return res.json({ success: true, transactionId, token: fusionData.token, paymentUrl: validPaymentUrl, payment_url: validPaymentUrl });
     }
   } catch (e) {
     console.error('ERROR /create-payment:', e.message || e);

@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { ENV } = require('../config/env');
 const { requireAdminSecret } = require('../middlewares/auth');
+const { getNetworksStatus } = require('../services/saspay');
 
 router.get('/', (req, res) => {
   res.json({ ok: true, message: 'DaloaMarket Payment API' });
@@ -35,11 +36,40 @@ router.get('/config', requireAdminSecret, (req, res) => {
   }
   res.json({
     status: 'ok',
+    PAYMENT_PROVIDER: ENV.PAYMENT_PROVIDER,
+    SASPAY_API_KEY_SET: !!ENV.SASPAY_API_KEY,
     FUSION_API_URL_SET: !!ENV.FUSION_API_URL,
     SUPABASE_URL_SET: !!ENV.SUPABASE_URL,
     SUPABASE_KEY_SET: !!ENV.SUPABASE_SERVICE_ROLE_KEY,
     SITE_URL: ENV.SITE_URL,
     PORT: ENV.PORT,
+  });
+});
+
+let cachedNetworks = null;
+let lastCacheTime = 0;
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+router.get('/payment-networks', async (req, res) => {
+  const now = Date.now();
+  if (cachedNetworks && now - lastCacheTime < CACHE_TTL_MS) {
+    return res.json({ success: true, cached: true, ...cachedNetworks });
+  }
+
+  const result = await getNetworksStatus('CI');
+  if (result.ok) {
+    cachedNetworks = { networks: result.networks, checkedAt: new Date().toISOString() };
+    lastCacheTime = now;
+    return res.json({ success: true, cached: false, ...cachedNetworks });
+  }
+
+  if (cachedNetworks) {
+    return res.json({ success: true, stale: true, ...cachedNetworks });
+  }
+
+  return res.status(502).json({
+    success: false,
+    message: 'Impossible de récupérer l\'état des réseaux de paiement',
   });
 });
 

@@ -1,72 +1,166 @@
 const express = require('express');
 const router = express.Router();
-const { checkConfig, getSupabaseAdminClient } = require('../config/env');
+const { checkConfig, getSupabaseAdminClient, secretMatches, ENV } = require('../config/env');
 const { checkPaymentNotification } = require('../services/moneyfusion');
+const { getCheckoutSession } = require('../services/saspay');
 const { createOrderFromEscrow } = require('../services/escrow');
 const { isUnderpaid, paidGrossAmount, confirmMonetizationOnce } = require('../services/monetization');
 
-// 2) Webhook Money Fusion
+/**
+ * Traitement des webhooks MoneyFusion
+ */
+async function handleMoneyFusionWebhook(req, res, personal) {
+  const transactionId = personal?.transactionId;
+  const type = personal?.type;
+
+  if (!transactionId || !type) return res.status(400).json({ ok: false, message: 'Données de requête invalides' });
+
+  const supabase = getSupabaseAdminClient();
+  if (!supabase) return res.status(503).json({ ok: false, message: 'DB indisponible' });
+
+  const isOrder = type === 'order';
+  const table = isOrder ? 'escrow_transactions' : 'monetization_transactions';
+
+  const { data: tx, error } = await supabase.from(table).select('*').eq('id', transactionId).maybeSingle();
+  if (error || !tx) return res.status(404).json({ ok: false, message: 'Transaction introuvable' });
+
+  if ((isOrder && tx.status !== 'pending') || (!isOrder && tx.status === 'confirmed')) {
+    return res.json({ ok: true, message: 'Déjà confirmée' });
+  }
+
+  const token = isOrder ? tx.payment_reference : tx.provider_token;
+  if (!token) return res.status(400).json({ ok: false, message: 'Token absent' });
+
+  const fusionData = await checkPaymentNotification(token);
+  if (!fusionData || fusionData.statut !== true || !fusionData.data) {
+    return res.json({ ok: true, status: 'pending' });
+  }
+
+  const fusionStatus = fusionData.data.statut;
+  const expectedAmount = Number(tx.total_amount ?? tx.amount);
+  if (fusionStatus === 'paid' && isUnderpaid(fusionData, expectedAmount)) {
+    const paid = paidGrossAmount(fusionData);
+    console.warn(`webhook: paiement insuffisant tx=${transactionId} brut=${paid} attendu=${expectedAmount}`);
+    return res.json({ ok: true, status: 'underpaid', paid, expected: expectedAmount });
+  }
+
+  if (fusionStatus === 'paid') {
+    if (isOrder) {
+      console.log('webhook: payment confirmed, creating order...');
+      await createOrderFromEscrow(supabase, tx, personal);
+    } else {
+      await confirmMonetizationOnce(supabase, tx);
+    }
+    return res.json({ ok: true, status: 'paid' });
+  }
+
+  if (fusionStatus === 'failure' || fusionStatus === 'no paid') {
+    await supabase.from(table).update({ status: isOrder ? 'cancelled' : 'failed' }).eq('id', transactionId);
+    return res.json({ ok: true, status: fusionStatus });
+  }
+
+  return res.json({ ok: true, status: 'pending' });
+}
+
+/**
+ * Traitement des webhooks SasPay
+ */
+async function handleSasPayWebhook(req, res) {
+  const payload = req.body;
+  if (ENV.SASPAY_WEBHOOK_SECRET) {
+    const signature = req.get('x-saspay-signature') || req.get('x-signature') || req.query.secret;
+    if (!secretMatches(signature, ENV.SASPAY_WEBHOOK_SECRET)) {
+      return res.status(403).json({ ok: false, message: 'Signature invalide' });
+    }
+  }
+
+  const data = payload?.data || payload;
+  const metadata = data?.metadata || payload?.metadata || {};
+  const transactionId = metadata.transactionId || data?.transaction_id || data?.id;
+
+  const supabase = getSupabaseAdminClient();
+  if (!supabase) return res.status(503).json({ ok: false, message: 'DB indisponible' });
+
+  let tx = null;
+  let isOrder = true;
+
+  if (transactionId) {
+    const { data: escrow } = await supabase
+      .from('escrow_transactions')
+      .select('*')
+      .or(`id.eq.${transactionId},payment_reference.eq.${transactionId}`)
+      .maybeSingle();
+
+    if (escrow) {
+      tx = escrow;
+      isOrder = true;
+    } else {
+      const { data: monTx } = await supabase
+        .from('monetization_transactions')
+        .select('*')
+        .or(`id.eq.${transactionId},provider_token.eq.${transactionId}`)
+        .maybeSingle();
+      if (monTx) {
+        tx = monTx;
+        isOrder = false;
+      }
+    }
+  }
+
+  if (!tx) {
+    return res.status(200).json({ ok: true, message: 'Transaction ignorée' });
+  }
+
+  const table = isOrder ? 'escrow_transactions' : 'monetization_transactions';
+  if ((isOrder && tx.status !== 'pending') || (!isOrder && tx.status === 'confirmed')) {
+    return res.json({ ok: true, message: 'Déjà confirmée' });
+  }
+
+  const token = isOrder ? tx.payment_reference : tx.provider_token;
+  const session = await getCheckoutSession(token);
+  const isPaid = session && (
+    session.status === 'PAID' ||
+    session.transaction_status === 'SUCCESS' ||
+    session.status === 'SUCCESS' ||
+    data?.status === 'SUCCESS' ||
+    payload?.event === 'transaction.success'
+  );
+
+  if (isPaid) {
+    if (isOrder) {
+      await createOrderFromEscrow(supabase, tx, metadata);
+    } else {
+      await confirmMonetizationOnce(supabase, tx);
+    }
+    return res.json({ ok: true, status: 'paid' });
+  }
+
+  if (session && ['FAILED', 'CANCELLED', 'EXPIRED'].includes(session.status)) {
+    await supabase.from(table).update({ status: isOrder ? 'cancelled' : 'failed' }).eq('id', tx.id);
+    return res.json({ ok: true, status: session.status });
+  }
+
+  return res.json({ ok: true, status: 'pending' });
+}
+
+// 2) Webhook unifié MoneyFusion / SasPay
 router.post('/payment-webhook', async (req, res) => {
   try {
     checkConfig();
     const payload = req.body;
     const personal = Array.isArray(payload?.personal_Info) ? payload.personal_Info[0] : null;
-    const transactionId = personal?.transactionId;
-    const type = personal?.type;
 
-    if (!transactionId || !type) return res.status(400).json({ ok: false, message: 'Données de requête invalides' });
-
-    const supabase = getSupabaseAdminClient();
-    if (!supabase) return res.status(503).json({ ok: false, message: 'DB indisponible' });
-
-    const isOrder = type === 'order';
-    const table = isOrder ? 'escrow_transactions' : 'monetization_transactions';
-
-    const { data: tx, error } = await supabase.from(table).select('*').eq('id', transactionId).maybeSingle();
-    if (error || !tx) return res.status(404).json({ ok: false, message: 'Transaction introuvable' });
-
-    if ((isOrder && tx.status !== 'pending') || (!isOrder && tx.status === 'confirmed')) {
-      return res.json({ ok: true, message: 'Déjà confirmée' });
+    if (personal) {
+      return await handleMoneyFusionWebhook(req, res, personal);
+    } else {
+      return await handleSasPayWebhook(req, res);
     }
-
-    const token = isOrder ? tx.payment_reference : tx.provider_token;
-    if (!token) return res.status(400).json({ ok: false, message: 'Token absent' });
-
-    const fusionData = await checkPaymentNotification(token);
-    if (!fusionData || fusionData.statut !== true || !fusionData.data) {
-      return res.json({ ok: true, status: 'pending' });
-    }
-
-    const fusionStatus = fusionData.data.statut;
-
-    // Contrôle du montant réellement encaissé (anti sous-paiement). Le montant
-    // attendu est celui fixé par le serveur à la création du paiement.
-    const expectedAmount = Number(tx.total_amount ?? tx.amount);
-    if (fusionStatus === 'paid' && isUnderpaid(fusionData, expectedAmount)) {
-      const paid = paidGrossAmount(fusionData);
-      console.warn(`webhook: paiement insuffisant tx=${transactionId} brut=${paid} attendu=${expectedAmount}`);
-      return res.json({ ok: true, status: 'underpaid', paid, expected: expectedAmount });
-    }
-
-    if (fusionStatus === 'paid') {
-      if (isOrder) {
-        console.log('webhook: payment confirmed, creating order...');
-        await createOrderFromEscrow(supabase, tx, personal);
-      } else {
-        await confirmMonetizationOnce(supabase, tx);
-      }
-      return res.json({ ok: true, status: 'paid' });
-    }
-
-    if (fusionStatus === 'failure' || fusionStatus === 'no paid') {
-      await supabase.from(table).update({ status: isOrder ? 'cancelled' : 'failed' }).eq('id', transactionId);
-      return res.json({ ok: true, status: fusionStatus });
-    }
-
-    return res.json({ ok: true, status: 'pending' });
   } catch (e) {
     return res.status(500).json({ ok: false, message: e.message });
   }
 });
+
+// Endpoint dédié explicite SasPay
+router.post('/saspay-webhook', handleSasPayWebhook);
 
 module.exports = router;

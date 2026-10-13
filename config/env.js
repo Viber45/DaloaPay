@@ -3,7 +3,12 @@ const crypto = require('crypto');
 require('dotenv').config();
 
 const ENV = {
+  PAYMENT_PROVIDER: process.env.PAYMENT_PROVIDER || 'moneyfusion', // 'moneyfusion' | 'saspay'
   FUSION_API_URL: process.env.FUSION_API_URL,
+  MONEYFUSION_PRIVATE_KEY: process.env.MONEYFUSION_PRIVATE_KEY || '',
+  SASPAY_API_KEY: process.env.SASPAY_API_KEY || '',
+  SASPAY_API_URL: (process.env.SASPAY_API_URL || 'https://api.saspay.me/api/v1').replace(/\/$/, ''),
+  SASPAY_WEBHOOK_SECRET: process.env.SASPAY_WEBHOOK_SECRET || '',
   SUPABASE_URL: process.env.SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY,
   SITE_URL: process.env.SITE_URL || 'https://daloamarket.com',
@@ -11,7 +16,6 @@ const ENV = {
   ADMIN_SECRET: process.env.ADMIN_SECRET || '',
   PUSH_WEBHOOK_SECRET: process.env.PUSH_WEBHOOK_SECRET || '',
   PAYOUT_WEBHOOK_SECRET: process.env.PAYOUT_WEBHOOK_SECRET || '',
-  MONEYFUSION_PRIVATE_KEY: process.env.MONEYFUSION_PRIVATE_KEY || '',
   VAPID_PUBLIC_KEY: process.env.VAPID_PUBLIC_KEY,
   VAPID_PRIVATE_KEY: process.env.VAPID_PRIVATE_KEY,
   VAPID_SUBJECT: process.env.VAPID_SUBJECT || 'mailto:contact@daloamarket.com',
@@ -27,8 +31,8 @@ function getSupabaseAdminClient() {
 }
 
 function checkConfig() {
-  if (!ENV.FUSION_API_URL || !ENV.SUPABASE_URL || !ENV.SUPABASE_SERVICE_ROLE_KEY) {
-    throw new Error('Config incomplete: FUSION_API_URL, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY required');
+  if (!ENV.SUPABASE_URL || !ENV.SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error('Config incomplete: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY required');
   }
 }
 
