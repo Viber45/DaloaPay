@@ -238,10 +238,14 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
       const paymentUrl = saspayRes.checkout_url;
 
       if (type === 'order') {
-        await supabase.from('escrow_transactions').update({ payment_reference: token }).eq('id', transactionId);
+        const { data: cur } = await supabase.from('escrow_transactions').select('order_metadata').eq('id', transactionId).maybeSingle();
+        const updatedMeta = { ...(cur?.order_metadata || {}), checkout_url: paymentUrl };
+        await supabase.from('escrow_transactions').update({ payment_reference: token, order_metadata: updatedMeta }).eq('id', transactionId);
         return res.json({ success: true, token, payment_url: paymentUrl, paymentUrl, transactionId });
       } else {
-        await supabase.from('monetization_transactions').update({ provider_token: token }).eq('id', transactionId);
+        const { data: curTx } = await supabase.from('monetization_transactions').select('metadata').eq('id', transactionId).maybeSingle();
+        const updatedMeta = { ...(curTx?.metadata || {}), checkout_url: paymentUrl };
+        await supabase.from('monetization_transactions').update({ provider_token: token, metadata: updatedMeta }).eq('id', transactionId);
         return res.json({ success: true, transactionId, token, paymentUrl, payment_url: paymentUrl });
       }
     }

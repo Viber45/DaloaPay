@@ -29,9 +29,13 @@ app.set('trust proxy', 1);
 app.use(corsMiddleware);
 app.options('*', cors(corsOptions));
 
-// 2. Limiteur global & Parser JSON
+// 2. Limiteur global & Parser JSON (avec conservation du rawBody pour HMAC)
 app.use(globalLimiter);
-app.use(express.json());
+app.use(express.json({
+  verify: (req, _res, buf) => {
+    req.rawBody = buf ? buf.toString('utf8') : '';
+  },
+}));
 
 // 3. Contrôle du bannissement d'IP
 app.use(createIpBanMiddleware(getSupabaseAdminClient()));

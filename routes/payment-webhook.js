@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const crypto = require('crypto');
 const { checkConfig, getSupabaseAdminClient, secretMatches, ENV } = require('../config/env');
 const { checkPaymentNotification } = require('../services/moneyfusion');
 const { getCheckoutSession } = require('../services/saspay');
@@ -63,16 +64,72 @@ async function handleMoneyFusionWebhook(req, res, personal) {
 }
 
 /**
+ * Valide la signature HMAC-SHA256 envoyée par SasPay.
+ * En-tête : X-Webhook-Signature
+ * Timestamp : X-Webhook-Timestamp
+ * Algorithme : HMAC-SHA256(secret, `${timestamp}.${rawBody}`)
+ * Rejet des horodatages > 5 minutes (300 secondes) pour parer aux attaques par rejeu.
+ */
+function verifySasPaySignature(req) {
+  const secretConfig = ENV.SASPAY_WEBHOOK_SECRET;
+  if (!secretConfig) return { valid: true };
+
+  const signature = req.get('x-webhook-signature') || req.get('x-saspay-signature');
+  const timestampHeader = req.get('x-webhook-timestamp') || req.get('x-saspay-timestamp');
+
+  if (!signature || !timestampHeader) {
+    return { valid: false, reason: 'En-têtes X-Webhook-Signature ou X-Webhook-Timestamp manquants' };
+  }
+
+  // Anti-rejeu : tolérance de 5 minutes (300 s)
+  const now = Math.floor(Date.now() / 1000);
+  let parsedTimestamp = Number(timestampHeader);
+  if (parsedTimestamp > 1e11) {
+    parsedTimestamp = Math.floor(parsedTimestamp / 1000);
+  }
+
+  if (Number.isNaN(parsedTimestamp) || Math.abs(now - parsedTimestamp) > 300) {
+    return { valid: false, reason: 'Horodatage expiré ou invalide (> 5 minutes)' };
+  }
+
+  const rawBody = req.rawBody || JSON.stringify(req.body);
+  const signedPayload = `${timestampHeader}.${rawBody}`;
+
+  // Support multi-secrets (séparés par virgule pour supporter plusieurs domaines)
+  const secrets = secretConfig.split(',').map((s) => s.trim()).filter(Boolean);
+
+  for (const secret of secrets) {
+    try {
+      const computedHash = crypto
+        .createHmac('sha256', secret)
+        .update(signedPayload)
+        .digest('hex');
+
+      const sigBuf = Buffer.from(signature, 'utf8');
+      const hashBuf = Buffer.from(computedHash, 'utf8');
+
+      if (sigBuf.length === hashBuf.length && crypto.timingSafeEqual(sigBuf, hashBuf)) {
+        return { valid: true };
+      }
+    } catch {
+      // Tester le secret suivant
+    }
+  }
+
+  return { valid: false, reason: 'Signature HMAC invalide' };
+}
+
+/**
  * Traitement des webhooks SasPay
  */
 async function handleSasPayWebhook(req, res) {
-  const payload = req.body;
-  if (ENV.SASPAY_WEBHOOK_SECRET) {
-    const signature = req.get('x-saspay-signature') || req.get('x-signature') || req.query.secret;
-    if (!secretMatches(signature, ENV.SASPAY_WEBHOOK_SECRET)) {
-      return res.status(403).json({ ok: false, message: 'Signature invalide' });
-    }
+  const verification = verifySasPaySignature(req);
+  if (!verification.valid) {
+    console.warn('[SasPay Webhook Rejected]:', verification.reason);
+    return res.status(403).json({ ok: false, message: verification.reason });
   }
+
+  const payload = req.body;
 
   const data = payload?.data || payload;
   const metadata = data?.metadata || payload?.metadata || {};
